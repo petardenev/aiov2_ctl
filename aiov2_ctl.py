@@ -6,6 +6,7 @@ import time
 import json
 import shutil
 import re
+import pwd
 from statistics import mean
 
 INSTALL_META_PATH = "/usr/local/share/aiov2_ctl/install.json"
@@ -45,14 +46,18 @@ def run_cmd(cmd, cwd=None):
     except subprocess.CalledProcessError:
         return False
 
-def get_git_root():
+def get_git_root(cwd=None):
+    # Anchored to the running script by default: the caller's working
+    # directory may well be an unrelated repository.
+    cwd = cwd or os.path.dirname(os.path.realpath(__file__))
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
             stderr=subprocess.DEVNULL,
             text=True
         ).strip()
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, OSError):
         return None
 
 
@@ -267,6 +272,7 @@ _aiov2_ctl()
         --boot-rails-status
         --add-apps
         --remove-apps
+        --fix-sdr
         --sync-rtc
     "
 
@@ -369,7 +375,7 @@ Meshtastic
 ----------
 An open-source, off-grid, decentralised mesh network for low-power devices.
 
- • Launch: meshtastic-mui
+ • Launch: meshtastic-ui
  • Set your call sign and country in settings
  • US users: set Frequency Slot to 20
  • Map packs go in: /home/USER/.portduino/default/maps
@@ -439,6 +445,7 @@ USAGE:
     aiov2_ctl --boot-rails-status
   sudo aiov2_ctl --add-apps
   sudo aiov2_ctl --remove-apps
+  sudo aiov2_ctl --fix-sdr
   sudo aiov2_ctl --sync-rtc
 
 FEATURES:
@@ -460,6 +467,7 @@ COMMANDS:
       --boot-rail      Set per-rail GPIO state to apply on boot
       --boot-rails-status   Show configured per-rail boot states
   --add-apps   Install HackerGadgets AIO apps
+  --fix-sdr    Free the RTL-SDR from the kernel DVB driver
   --sync-rtc   Write current system time to hardware RTC
   --remove-apps   Remove HackerGadgets AIO apps
 
@@ -549,6 +557,514 @@ def disable_autostart():
 
     return 0
 
+def read_os_release():
+    info = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" not in line:
+                    continue
+                key, _, value = line.strip().partition("=")
+                info[key] = value.strip('"')
+    except OSError:
+        pass
+    return info
+
+
+def meshtastic_repo_dir():
+    """
+    Pick the OBS repo flavour matching this host.
+
+    The Meshtastic builds are per-suite: the Debian_12 build links against
+    libgpiod2, which trixie-based systems (Kali rolling included) no longer
+    ship, so picking the wrong one makes meshtasticd uninstallable.
+    """
+    info = read_os_release()
+    codename = info.get("VERSION_CODENAME", "").lower()
+    distro_id = info.get("ID", "").lower()
+
+    prefix = "Raspbian" if distro_id == "raspbian" else "Debian"
+
+    if codename in ("bookworm", "kali-last-snapshot"):
+        return f"{prefix}_12"
+    if codename in ("trixie", "forky", "sid", "unstable", "kali-rolling"):
+        return f"{prefix}_13"
+
+    # Rolling or unknown codename: fall back to the numeric base version.
+    try:
+        with open("/etc/debian_version") as f:
+            major = int(f.read().strip().split(".")[0])
+        return f"{prefix}_12" if major <= 12 else f"{prefix}_13"
+    except (OSError, ValueError):
+        return f"{prefix}_13"
+
+
+def ensure_meshtastic_repo():
+    """
+    Point the Meshtastic APT source at the suite this host can actually
+    install, rewriting it if something (e.g. the AIO board package's
+    postinst) left the wrong one behind. Returns True if it was changed.
+    """
+    list_path = "/etc/apt/sources.list.d/network:Meshtastic:beta.list"
+    key_path = "/etc/apt/trusted.gpg.d/network_Meshtastic_beta.gpg"
+    repo_dir = meshtastic_repo_dir()
+    base = "http://download.opensuse.org/repositories/network:/Meshtastic:/beta"
+    wanted = f"deb {base}/{repo_dir}/ /\n"
+
+    try:
+        with open(list_path) as f:
+            current = f.read()
+    except OSError:
+        current = ""
+
+    if current.strip() == wanted.strip() and os.path.exists(key_path):
+        return False
+
+    print(f"Pointing Meshtastic repo at {repo_dir}…")
+    with open(list_path, "w") as f:
+        f.write(wanted)
+    os.chmod(list_path, 0o644)
+
+    key_url = (
+        "https://download.opensuse.org/repositories/"
+        f"network:Meshtastic:beta/{repo_dir}/Release.key"
+    )
+    try:
+        armoured = subprocess.check_output(
+            ["curl", "-fsSL", key_url],
+            stderr=subprocess.DEVNULL
+        )
+        dearmoured = subprocess.run(
+            ["gpg", "--dearmor"],
+            input=armoured,
+            stdout=subprocess.PIPE,
+            check=True
+        ).stdout
+        with open(key_path, "wb") as f:
+            f.write(dearmoured)
+        os.chmod(key_path, 0o644)
+    except (subprocess.CalledProcessError, OSError):
+        print("Warning: could not refresh the Meshtastic signing key.")
+
+    return True
+
+
+def apt_install(packages, recommends=False):
+    """Install packages, returning the list that failed."""
+    # Several of these packages ship conffiles that earlier source-based
+    # installs already wrote, and a conffile prompt would hang a -y run.
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+
+    failed = []
+    for pkg in packages:
+        cmd = ["apt", "install"]
+        if recommends:
+            cmd.append("--install-recommends")
+        cmd += [
+            "-o", "Dpkg::Options::=--force-confdef",
+            "-o", "Dpkg::Options::=--force-confold",
+            pkg, "-y",
+        ]
+
+        print(f"\nInstalling {pkg}…")
+        if subprocess.call(cmd, env=env) != 0:
+            print(f"Failed to install {pkg}.")
+            failed.append(pkg)
+
+    return failed
+
+
+def target_user():
+    """The desktop user behind a sudo invocation."""
+    user = os.environ.get("SUDO_USER")
+    if user and user != "root":
+        return user
+    try:
+        return subprocess.check_output(["logname"], text=True).strip()
+    except (subprocess.CalledProcessError, OSError):
+        return None
+
+
+def target_home(user=None):
+    user = user or target_user()
+    if not user:
+        return None
+    try:
+        return pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return None
+
+
+def prepare_pygpsclient_profile():
+    """
+    The pygpsclient package's installer appends a PATH line to the login
+    profile and then sources it with bash. On a zsh system that profile
+    contains zsh-only builtins, so bash aborts and the postinst never
+    creates the launcher symlink. Guard the zsh-only block and drop the
+    duplicate PATH lines earlier failed runs left behind.
+    """
+    home = target_home()
+    if not home:
+        return
+
+    for name in (".zprofile", ".zshrc"):
+        path = os.path.join(home, name)
+        if not os.path.isfile(path):
+            continue
+
+        try:
+            with open(path) as f:
+                lines = f.read().split("\n")
+        except OSError:
+            continue
+
+        out = []
+        changed = False
+        seen_path_line = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Collapse the repeated PyGPSClient PATH stanza to one copy.
+            if stripped == "# Path to PyGPSClient executable":
+                if seen_path_line:
+                    changed = True
+                    continue
+                out.append(line)
+                continue
+
+            if stripped.startswith('export PATH=') and ".pygpsclient/bin" in stripped:
+                if seen_path_line:
+                    changed = True
+                    continue
+                seen_path_line = True
+                out.append(line)
+                continue
+
+            # zsh-only builtin: skip it when a POSIX shell sources the file.
+            if stripped.startswith("emulate ") and "ZSH_VERSION" not in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                out.append(f'{indent}[ -n "$ZSH_VERSION" ] && {stripped}')
+                changed = True
+                continue
+
+            out.append(line)
+
+        if changed:
+            print(f"Making {path} safe to source from sh…")
+            with open(path, "w") as f:
+                f.write("\n".join(out))
+
+
+def finalize_pygpsclient():
+    """Create the launcher the postinst skips when its install script trips."""
+    home = target_home()
+    if not home:
+        return
+
+    src = os.path.join(home, ".pygpsclient", "bin", "pygpsclient")
+    link = "/usr/local/bin/pygpsclient"
+
+    if not os.path.isfile(src) or os.path.exists(link):
+        return
+
+    print(f"Linking {link} → {src}")
+    try:
+        os.symlink(src, link)
+    except OSError as exc:
+        print(f"Could not create the pygpsclient launcher: {exc}")
+
+
+def readsb_json_present():
+    return os.path.isfile("/run/readsb/aircraft.json")
+
+
+def readsb_service_running():
+    """
+    A decoder only counts if the unit is settled. readsb writes its json
+    before it opens the SDR, so with no dongle attached the files appear
+    and are then wiped again by the Restart=always loop.
+    """
+    out = subprocess.run(
+        ["systemctl", "is-active", "readsb"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True
+    ).stdout.strip()
+    return out == "active" and readsb_json_present()
+
+
+SDR_BLACKLIST_PATH = "/etc/modprobe.d/blacklist-rtlsdr.conf"
+SDR_UDEV_PATH = "/etc/udev/rules.d/99-rtlsdr-nosuspend.rules"
+
+SDR_UDEV_RULES = """# RTL2832U SDR on the AIO v2 board.
+# USB autosuspend (usbcore default: 2s) leaves the R820T tuner
+# unresponsive on I2C (r82xx_write: i2c wr failed=-9) and can drop the
+# device off the bus entirely. Keep it powered whenever it is attached.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2832", ATTR{power/control}="on", ATTR{power/autosuspend}="-1"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", ATTR{power/control}="on", ATTR{power/autosuspend}="-1"
+"""
+
+SDR_BLACKLIST = """# The RTL2832U on the AIO v2 board is used as an SDR via librtlsdr
+# (readsb, SDR++, rtl_433). The kernel DVB-T driver claims the device
+# first and blocks them, so keep it out of the way.
+blacklist dvb_usb_rtl28xxu
+blacklist rtl2832
+blacklist rtl2830
+blacklist dvb_usb_v2
+"""
+
+
+def rtlsdr_present():
+    """True if an RTL2832U is on the USB bus."""
+    out = GpioController.run(["lsusb"]) or ""
+    return "0bda:2832" in out or "0bda:2838" in out
+
+
+def dvb_driver_loaded():
+    return "dvb_usb_rtl28xxu" in (GpioController.run(["lsmod"]) or "")
+
+
+def rtlsdr_usable():
+    """True if librtlsdr can claim the tuner (no DVB driver in the way)."""
+    return rtlsdr_present() and not dvb_driver_loaded()
+
+
+def set_sdr_rail(state):
+    pin = GPIO_MAP.get("SDR")
+    if pin is None:
+        return False
+    GpioController.set_gpio(pin, state)
+    return True
+
+
+def wait_for_rtlsdr(seconds=10):
+    for _ in range(seconds):
+        time.sleep(1)
+        if rtlsdr_present():
+            return True
+    return False
+
+
+def cycle_sdr_rail():
+    """
+    Power cycle the SDR rail so the tuner re-enumerates.
+
+    The RTL2832U can wedge after a driver unbind or a marginal power
+    event — it drops to full-speed and answers descriptor reads with
+    -EPIPE until the rail is dropped. We own that rail, so use it.
+    """
+    if not set_sdr_rail(False):
+        return False
+
+    print("Power cycling the SDR rail…")
+    time.sleep(3)
+    set_sdr_rail(True)
+    return wait_for_rtlsdr()
+
+
+def unload_dvb_driver():
+    """
+    Remove the kernel DVB-T driver from the tuner.
+
+    It holds a reference for as long as the device is attached, so a
+    plain `modprobe -r` fails while the rail is up — and the driver then
+    simply rebinds the next time the device enumerates. Drop the rail
+    first, unload, then bring it back with the blacklist in force.
+    """
+    if not dvb_driver_loaded():
+        return True
+
+    print("Unloading dvb_usb_rtl28xxu…")
+    set_sdr_rail(False)
+    time.sleep(2)
+
+    for mod in ("dvb_usb_rtl28xxu", "dvb_usb_v2"):
+        subprocess.call(["modprobe", "-r", mod],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    removed = not dvb_driver_loaded()
+
+    set_sdr_rail(True)
+    wait_for_rtlsdr()
+
+    if not removed:
+        print("dvb_usb_rtl28xxu is still loaded; a reboot will apply the blacklist.")
+
+    return removed
+
+
+def ensure_sdr_driver():
+    """
+    Keep the kernel DVB-T driver off the RTL2832U.
+
+    Left to itself, dvb_usb_rtl28xxu binds the tuner at enumeration and
+    librtlsdr consumers — readsb, SDR++, rtl_433 — fail with
+    `usb_claim_interface error -6`. Blacklisting it is a standard
+    RTL-SDR setup step and this board is no exception.
+    """
+    try:
+        with open(SDR_BLACKLIST_PATH) as f:
+            current = f.read()
+    except OSError:
+        current = None
+
+    if current != SDR_BLACKLIST:
+        print(f"Blacklisting the DVB-T driver → {SDR_BLACKLIST_PATH}")
+        with open(SDR_BLACKLIST_PATH, "w") as f:
+            f.write(SDR_BLACKLIST)
+        os.chmod(SDR_BLACKLIST_PATH, 0o644)
+
+    ensure_sdr_udev_rules()
+
+    return unload_dvb_driver()
+
+
+def ensure_sdr_udev_rules():
+    """Keep USB autosuspend away from the tuner."""
+    try:
+        with open(SDR_UDEV_PATH) as f:
+            current = f.read()
+    except OSError:
+        current = None
+
+    if current == SDR_UDEV_RULES:
+        return
+
+    print(f"Disabling USB autosuspend for the tuner → {SDR_UDEV_PATH}")
+    with open(SDR_UDEV_PATH, "w") as f:
+        f.write(SDR_UDEV_RULES)
+    os.chmod(SDR_UDEV_PATH, 0o644)
+
+    subprocess.call(["udevadm", "control", "--reload-rules"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def ensure_rtlsdr_ready():
+    """Get the on-board tuner into a state librtlsdr can open."""
+    ensure_sdr_driver()
+
+    if rtlsdr_usable():
+        return True
+
+    if not rtlsdr_present():
+        print("No RTL-SDR on the USB bus; attempting recovery…")
+        cycle_sdr_rail()
+
+    return rtlsdr_usable()
+
+
+def ensure_adsb_decoder():
+    """
+    tar1090's installer refuses to run unless a decoder is already
+    producing aircraft.json. Install readsb and get it emitting one.
+
+    With no SDR dongle attached readsb exits at sdrOpen(), so fall back to
+    reconfiguring the unit for net-only operation: the installer only
+    needs the json to exist, and tar1090's own postinst rebuilds readsb
+    and restarts the service partway through, which would wipe any
+    throwaway instance we started alongside it.
+
+    Returns a handle for stop_temp_decoder(), or None if nothing to undo.
+    """
+    if readsb_service_running():
+        return None
+
+    if not shutil.which("readsb"):
+        print("\nInstalling readsb (required by tar1090)…")
+        if apt_install(["readsb"]):
+            print("readsb could not be installed; skipping tar1090.")
+            return None
+
+    ensure_rtlsdr_ready()
+
+    subprocess.call(["systemctl", "start", "readsb"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    for _ in range(10):
+        if readsb_service_running():
+            return None
+        time.sleep(1)
+
+    # A readsb that dies mid-stream can leave the tuner wedged: it drops
+    # off the bus and re-enumerates at full speed with failing descriptor
+    # reads. Stop the restart loop, power cycle the rail, and retry once.
+    print("readsb did not come up; recovering the tuner…")
+    subprocess.call(["systemctl", "stop", "readsb"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
+
+    if ensure_rtlsdr_ready():
+        subprocess.call(["systemctl", "start", "readsb"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(10):
+            if readsb_service_running():
+                return None
+            time.sleep(1)
+        subprocess.call(["systemctl", "stop", "readsb"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print("No SDR decoder running; running readsb net-only for the install…")
+    print("(tar1090 only needs aircraft.json to exist to complete setup.)")
+
+    defaults = "/etc/default/readsb"
+    try:
+        with open(defaults) as f:
+            original = f.read()
+    except OSError:
+        print("Could not read /etc/default/readsb; skipping tar1090 setup.")
+        return None
+
+    patched, count = re.subn(
+        r"^RECEIVER_OPTIONS=.*$",
+        'RECEIVER_OPTIONS="--net-only"',
+        original,
+        flags=re.MULTILINE
+    )
+    if not count:
+        patched = original.rstrip("\n") + '\nRECEIVER_OPTIONS="--net-only"\n'
+
+    with open(defaults, "w") as f:
+        f.write(patched)
+
+    subprocess.call(["systemctl", "restart", "readsb"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    handle = {"defaults": defaults, "original": original}
+
+    for _ in range(15):
+        if readsb_service_running():
+            return handle
+        time.sleep(1)
+
+    print("Could not get a decoder to produce aircraft.json.")
+    return handle
+
+
+def stop_temp_decoder(handle):
+    """Put the receiver config back the way we found it."""
+    if not handle:
+        return
+
+    try:
+        with open(handle["defaults"], "w") as f:
+            f.write(handle["original"])
+    except OSError as exc:
+        print(f"Could not restore {handle['defaults']}: {exc}")
+        return
+
+    # tar1090's postinst leaves readsb stopped and disabled on purpose —
+    # the launcher starts it on demand — so only reload a running unit.
+    if subprocess.run(
+        ["systemctl", "is-active", "readsb"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    ).returncode == 0:
+        subprocess.call(["systemctl", "restart", "readsb"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def add_apps():
     if os.geteuid() != 0:
         print("This command requires sudo.")
@@ -557,28 +1073,42 @@ def add_apps():
 
     draw_header("Installing HackerGadgets AIO applications")
 
-    subprocess.check_call(["apt", "update"])
+    subprocess.call(["apt", "update"])
 
-    subprocess.check_call([
-        "apt", "--install-recommends",
-        "install",
-        "hackergadgets-uconsole-aio-board",
-        "-y"
-    ])
+    # The board package drops in the Meshtastic APT source, so install it
+    # first and correct the suite afterwards.
+    failed = apt_install(["hackergadgets-uconsole-aio-board"], recommends=True)
 
-    subprocess.check_call([
-        "apt", "install",
-        "meshtastic-mui",
-        "sdrpp-brown",
-        "tar1090",
-        "pygpsclient",
-        "-y"
-    ])
+    if ensure_meshtastic_repo():
+        subprocess.call(["apt", "update"])
 
-    print("\nInstallation complete.\n")
+    # Installed one at a time so a single broken package does not block
+    # the rest of the set.
+    failed += apt_install(["meshtastic-mui", "sdrpp-brown"])
+
+    prepare_pygpsclient_profile()
+    failed += apt_install(["pygpsclient"])
+    finalize_pygpsclient()
+    prepare_pygpsclient_profile()
+
+    decoder = ensure_adsb_decoder()
+    try:
+        failed += apt_install(["tar1090"])
+    finally:
+        stop_temp_decoder(decoder)
+
+    if failed:
+        print("\nInstallation finished with errors.")
+        print("These packages could not be installed:")
+        for pkg in failed:
+            print(f"  • {pkg}")
+        print("\nRe-run after checking the apt output above.\n")
+    else:
+        print("\nInstallation complete.\n")
+
     print(POST_INSTALL_TIPS)
     report_and_disable_mesh_autostart_if_default("Meshtastic boot config status:")
-    return 0
+    return 1 if failed else 0
 
 
 def remove_apps():
@@ -612,6 +1142,28 @@ def remove_apps():
     print("\nApplications removed.")
     return 0
 
+
+
+def fix_sdr():
+    if os.geteuid() != 0:
+        print("This command requires sudo.")
+        print("Run: sudo aiov2_ctl --fix-sdr")
+        return 1
+
+    draw_header("Repairing RTL-SDR access")
+
+    if ensure_rtlsdr_ready():
+        print("\nRTL-SDR is available to librtlsdr.")
+        out = GpioController.run(["lsusb"]) or ""
+        for line in out.split("\n"):
+            if "0bda:2832" in line or "0bda:2838" in line:
+                print(f"  {line.strip()}")
+        print("\nOnly one app can use the SDR at a time.")
+        return 0
+
+    print("\nRTL-SDR is still unavailable.")
+    print("Check that the SDR rail is on (aiov2_ctl SDR on) and the module is seated.")
+    return 1
 
 
 def sync_rtc():
@@ -1226,6 +1778,41 @@ def run_gui():
     sys.exit(app.exec())
 
 
+def ensure_sudo_path_link(dst):
+    """
+    sudo's secure_path does not include /usr/local/bin on every distro
+    (Kali, for one), which breaks the documented `sudo aiov2_ctl ...`
+    commands. Drop a symlink somewhere secure_path does cover.
+    """
+    try:
+        out = subprocess.check_output(
+            ["sudo", "-n", "sh", "-c", "printf %s \"$PATH\""],
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+        sudo_path = out.split(":")
+    except (subprocess.CalledProcessError, OSError):
+        return
+
+    bin_dir = os.path.dirname(dst)
+    if bin_dir in sudo_path:
+        return
+
+    for candidate in ("/usr/bin", "/usr/sbin"):
+        if candidate not in sudo_path:
+            continue
+        link = os.path.join(candidate, os.path.basename(dst))
+        if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(dst):
+            return
+        if os.path.exists(link) and not os.path.islink(link):
+            return
+        print(f"sudo does not search {bin_dir}; linking {link} → {dst}\n")
+        if os.path.islink(link):
+            os.remove(link)
+        os.symlink(dst, link)
+        return
+
+
 def install_self():
     if os.geteuid() != 0:
         print("Install requires sudo.")
@@ -1246,11 +1833,12 @@ def install_self():
         if repo_from_meta and os.path.isdir(repo_from_meta):
             repo = repo_from_meta
 
-    if repo:
+    if repo and os.path.isfile(os.path.join(repo, "aiov2_ctl.py")):
         repo = os.path.realpath(repo)
         src = os.path.join(repo, "aiov2_ctl.py")
         img_src = os.path.join(repo, "img")
     else:
+        repo = None
         src = os.path.realpath(__file__)
         img_src = None
 
@@ -1280,6 +1868,8 @@ def install_self():
     else:
         subprocess.check_call(["cp", src, dst])
         subprocess.check_call(["chmod", "+x", dst])
+
+    ensure_sudo_path_link(dst)
 
     # ------------------------------
     # Install assets (icons, etc.)
@@ -1553,6 +2143,9 @@ def main():
 
     elif arg == "--remove-apps":
         sys.exit(remove_apps())
+
+    elif arg == "--fix-sdr":
+        sys.exit(fix_sdr())
 
     elif arg == "--sync-rtc":
         sys.exit(sync_rtc())
