@@ -273,6 +273,7 @@ _aiov2_ctl()
         --add-apps
         --remove-apps
         --fix-sdr
+        --sdr-biastee
         --sync-rtc
     "
 
@@ -298,7 +299,7 @@ _aiov2_ctl()
         return 0
     fi
 
-    if [[ "${prev}" == "--mesh-on-boot" ]]; then
+    if [[ "${prev}" == "--mesh-on-boot" || "${prev}" == "--sdr-biastee" ]]; then
         COMPREPLY=( $(compgen -W "on off status" -- "${cur}") )
         return 0
     fi
@@ -446,6 +447,7 @@ USAGE:
   sudo aiov2_ctl --add-apps
   sudo aiov2_ctl --remove-apps
   sudo aiov2_ctl --fix-sdr
+  sudo aiov2_ctl --sdr-biastee on|off|status
   sudo aiov2_ctl --sync-rtc
 
 FEATURES:
@@ -468,6 +470,7 @@ COMMANDS:
       --boot-rails-status   Show configured per-rail boot states
   --add-apps   Install HackerGadgets AIO apps
   --fix-sdr    Free the RTL-SDR from the kernel DVB driver
+  --sdr-biastee  Power the SDR antenna input (bias tee) while readsb runs
   --sync-rtc   Write current system time to hardware RTC
   --remove-apps   Remove HackerGadgets AIO apps
 
@@ -815,6 +818,54 @@ blacklist rtl2830
 blacklist dvb_usb_v2
 """
 
+SDR_RECOVERY_DROPIN_PATH = "/etc/systemd/system/readsb.service.d/10-aiov2-sdr-recovery.conf"
+SDR_BIASTEE_DROPIN_PATH = "/etc/systemd/system/readsb.service.d/20-aiov2-sdr-biastee.conf"
+RTL_BIAST = "/usr/bin/rtl_biast"
+SDR_WATCHDOG_SERVICE = "aiov2-sdr-watchdog.service"
+SDR_WATCHDOG_TIMER = "aiov2-sdr-watchdog.timer"
+
+SDR_RECOVERY_DROPIN = """# Installed by aiov2_ctl --install.
+# The on-board RTL2832U intermittently wedges at tuner init or drops off
+# USB, and readsb's Restart= loop cannot bring it back on its own. Wait
+# for the tuner before starting, and power cycle the SDR rail after a
+# failed run.
+[Unit]
+After=aiov2-rails-boot.service
+
+[Service]
+ExecStartPre=+/usr/bin/python3 /usr/local/bin/aiov2_ctl --sdr-recovery prestart
+ExecStopPost=+/usr/bin/python3 /usr/local/bin/aiov2_ctl --sdr-recovery poststop
+TimeoutStartSec=60
+"""
+
+SDR_BIASTEE_DROPIN = f"""# Installed by aiov2_ctl --sdr-biastee on.
+# Debian/Kali readsb builds accept --enable-biastee but never switch the
+# rtlsdr bias tee, so turn it (GPIO0) on just before readsb opens the
+# tuner. It stays on until the SDR loses power and is set again on every
+# start, including after an SDR rail power cycle.
+[Service]
+ExecStartPre=+{RTL_BIAST} -d 0 -b 1
+"""
+
+SDR_WATCHDOG_SERVICE_UNIT = """[Unit]
+Description=AIO v2 recover readsb if the RTL-SDR stops delivering samples
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/aiov2_ctl --sdr-recovery check
+"""
+
+SDR_WATCHDOG_TIMER_UNIT = """[Unit]
+Description=AIO v2 check readsb RTL-SDR sample flow every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+"""
+
 
 def rtlsdr_present():
     """True if an RTL2832U is on the USB bus."""
@@ -839,10 +890,11 @@ def set_sdr_rail(state):
     return True
 
 
-def wait_for_rtlsdr(seconds=10):
+def wait_for_rtlsdr(seconds=10, check=None):
+    check = check or rtlsdr_present
     for _ in range(seconds):
         time.sleep(1)
-        if rtlsdr_present():
+        if check():
             return True
     return False
 
@@ -1164,6 +1216,162 @@ def fix_sdr():
     print("\nRTL-SDR is still unavailable.")
     print("Check that the SDR rail is on (aiov2_ctl SDR on) and the module is seated.")
     return 1
+
+
+def read_sysfs(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def rtlsdr_sysfs():
+    """sysfs directory of the on-board RTL2832U, or None."""
+    base = "/sys/bus/usb/devices"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return None
+
+    for name in names:
+        dev = os.path.join(base, name)
+        if (read_sysfs(os.path.join(dev, "idVendor")) == "0bda"
+                and read_sysfs(os.path.join(dev, "idProduct")) in ("2832", "2838")):
+            return dev
+    return None
+
+
+def rtlsdr_high_speed():
+    """A wedged tuner re-enumerates at full speed (12M) or not at all."""
+    dev = rtlsdr_sysfs()
+    return dev is not None and read_sysfs(os.path.join(dev, "speed")) == "480"
+
+
+def rtlsdr_in_use():
+    """True if another program (SDR++, gqrx, …) holds the tuner open."""
+    dev = rtlsdr_sysfs()
+    if not dev:
+        return False
+
+    try:
+        node = "/dev/bus/usb/%03d/%03d" % (
+            int(read_sysfs(os.path.join(dev, "busnum"))),
+            int(read_sysfs(os.path.join(dev, "devnum"))),
+        )
+        return subprocess.call(["fuser", "-s", node],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) == 0
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def readsb_stalled(grace=150, stale=90):
+    """
+    readsb is up but the tuner has stopped delivering samples. readsb exits
+    when it loses the device, but a wedged tuner can also leave it running
+    with nothing coming in.
+    """
+    if not readsb_service_running():
+        return False
+
+    pid = GpioController.run(["systemctl", "show", "readsb", "-p", "MainPID", "--value"])
+    uptime = GpioController.run(["ps", "-o", "etimes=", "-p", pid or "0"])
+    if not uptime or int(uptime) < grace:
+        return False
+
+    try:
+        with open("/run/readsb/stats.json") as f:
+            stats = json.load(f)
+        return (time.time() - stats["now"] >= stale
+                or stats["last1min"]["local"]["samples_processed"] == 0)
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+
+
+def sdr_recovery(stage):
+    """
+    Hooks behind SDR_RECOVERY_DROPIN and the SDR watchdog timer. Always
+    succeeds: a failing hook would only stack a unit failure on top of
+    readsb's own Restart= loop.
+    """
+    # Leave a rail that was switched off on purpose alone.
+    if not GpioController.get_gpio(GPIO_MAP["SDR"]):
+        if stage == "prestart":
+            print("SDR rail is off; turn it on with: aiov2_ctl SDR on")
+        return 0
+
+    if stage == "prestart":
+        if not wait_for_rtlsdr(20, rtlsdr_high_speed):
+            print("RTL-SDR has not enumerated at high speed.")
+
+    elif stage == "poststop":
+        # Set by systemd; "success" covers a plain `systemctl stop`.
+        if os.environ.get("SERVICE_RESULT", "success") == "success":
+            return 0
+        if rtlsdr_in_use():
+            print("RTL-SDR is held by another program; not power cycling.")
+            return 0
+        if not cycle_sdr_rail():
+            print("RTL-SDR did not come back after the power cycle.")
+
+    elif stage == "check":
+        if not readsb_stalled():
+            return 0
+        print("readsb is running but receiving no samples; recovering the tuner…")
+        subprocess.call(["systemctl", "stop", "readsb"])
+        cycle_sdr_rail()
+        subprocess.call(["systemctl", "start", "readsb"])
+
+    return 0
+
+
+def sdr_biastee(state):
+    """Power the SDR antenna input (bias tee) whenever readsb runs."""
+    enabled = os.path.exists(SDR_BIASTEE_DROPIN_PATH)
+    if state == "status":
+        print(f"SDR bias tee for readsb: {'ON' if enabled else 'OFF'}")
+        return 0
+
+    if os.geteuid() != 0:
+        rerun_with_sudo(["--sdr-biastee", state])
+
+    if state == "on" and not os.path.exists(RTL_BIAST):
+        print(f"{RTL_BIAST} not found. Install it with: sudo apt install rtl-sdr")
+        return 1
+
+    readsb_active = subprocess.call(["systemctl", "is-active", "--quiet", "readsb"]) == 0
+
+    if state == "on":
+        os.makedirs(os.path.dirname(SDR_BIASTEE_DROPIN_PATH), exist_ok=True)
+        with open(SDR_BIASTEE_DROPIN_PATH, "w") as f:
+            f.write(SDR_BIASTEE_DROPIN)
+        os.chmod(SDR_BIASTEE_DROPIN_PATH, 0o644)
+    elif enabled:
+        os.remove(SDR_BIASTEE_DROPIN_PATH)
+
+    subprocess.call(["systemctl", "daemon-reload"])
+
+    def biast_off():
+        if os.path.exists(RTL_BIAST):
+            subprocess.call([RTL_BIAST, "-d", "0", "-b", "0"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # The bias tee outlives the process that set it, so switching it off
+    # needs the tuner free for a moment.
+    if readsb_active and state == "on":
+        subprocess.call(["systemctl", "restart", "readsb"])
+    elif readsb_active:
+        subprocess.call(["systemctl", "stop", "readsb"])
+        biast_off()
+        subprocess.call(["systemctl", "start", "readsb"])
+    elif state == "off" and rtlsdr_present() and not rtlsdr_in_use():
+        biast_off()
+
+    print(f"SDR bias tee for readsb set to {state.upper()}")
+    if state == "on" and not readsb_active:
+        print("It switches on the next time readsb starts.")
+    return 0
 
 
 def sync_rtc():
@@ -1904,8 +2112,24 @@ def install_self():
     with open(RAILS_BOOT_SERVICE_PATH, "w") as f:
         f.write(RAILS_BOOT_SERVICE_UNIT)
     os.chmod(RAILS_BOOT_SERVICE_PATH, 0o644)
+
+    # ------------------------------
+    # Install readsb SDR recovery
+    # ------------------------------
+    print(f"Installing readsb SDR recovery → {SDR_RECOVERY_DROPIN_PATH}\n")
+    os.makedirs(os.path.dirname(SDR_RECOVERY_DROPIN_PATH), exist_ok=True)
+    for path, content in (
+        (SDR_RECOVERY_DROPIN_PATH, SDR_RECOVERY_DROPIN),
+        (f"/etc/systemd/system/{SDR_WATCHDOG_SERVICE}", SDR_WATCHDOG_SERVICE_UNIT),
+        (f"/etc/systemd/system/{SDR_WATCHDOG_TIMER}", SDR_WATCHDOG_TIMER_UNIT),
+    ):
+        with open(path, "w") as f:
+            f.write(content)
+        os.chmod(path, 0o644)
+
     subprocess.call(["systemctl", "daemon-reload"])
     subprocess.call(["systemctl", "enable", RAILS_BOOT_SERVICE])
+    subprocess.call(["systemctl", "enable", "--now", SDR_WATCHDOG_TIMER])
 
     os.makedirs(os.path.dirname(INSTALL_META_PATH), exist_ok=True)
     with open(INSTALL_META_PATH, "w") as f:
@@ -2137,6 +2361,20 @@ def main():
 
     elif arg == "--apply-boot-rails":
         sys.exit(apply_rails_on_boot())
+
+    elif arg == "--sdr-recovery":
+        stage = sys.argv[2] if len(sys.argv) > 2 else ""
+        if stage not in ("prestart", "poststop", "check"):
+            print("Usage: aiov2_ctl --sdr-recovery prestart|poststop|check")
+            sys.exit(1)
+        sys.exit(sdr_recovery(stage))
+
+    elif arg == "--sdr-biastee":
+        state = sys.argv[2].lower() if len(sys.argv) > 2 else ""
+        if state not in ("on", "off", "status"):
+            print("Usage: aiov2_ctl --sdr-biastee on|off|status")
+            sys.exit(1)
+        sys.exit(sdr_biastee(state))
 
     elif arg == "--add-apps":
         sys.exit(add_apps())

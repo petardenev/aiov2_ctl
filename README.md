@@ -71,6 +71,12 @@ Install also enables the rail boot apply service:
 - `aiov2-rails-boot.service`
 - Applies configured rail boot states at startup
 
+and the readsb SDR recovery:
+
+- `/etc/systemd/system/readsb.service.d/10-aiov2-sdr-recovery.conf` — waits for the RTL-SDR before readsb starts, and power cycles the SDR rail after readsb fails (skipped if the rail is off or another app holds the SDR)
+- `aiov2-sdr-watchdog.timer` — every minute, recovers readsb if it is running but no longer receiving samples
+- Keep the SDR powered at boot for ADS-B with `sudo aiov2_ctl --boot-rail SDR on`
+
 ---
 
 ## 3) Optional: HackerGadgets AIO Companion Apps
@@ -115,6 +121,20 @@ sudo aiov2_ctl --sync-rtc
 Writes the **current system time** to the hardware RTC using `hwclock -w`.
 
 > Only run this after confirming system time is correct (e.g. via NTP).
+
+---
+
+### RTL-SDR bias tee for readsb
+
+```bash
+sudo aiov2_ctl --sdr-biastee on
+sudo aiov2_ctl --sdr-biastee off
+aiov2_ctl --sdr-biastee status
+```
+
+Powers the SDR antenna input (bias tee) every time readsb starts, for an active antenna or inline LNA. Debian/Kali readsb builds ignore `--enable-biastee` on RTL-SDRs, so this adds `readsb.service.d/20-aiov2-sdr-biastee.conf`, which runs `rtl_biast -b 1` before readsb opens the tuner (needs the `rtl-sdr` package).
+
+> Only enable it with an antenna or LNA that expects DC power. The bias tee stays on until the SDR loses power, so turn it off before connecting a passive antenna for other SDR apps.
 
 ---
 
