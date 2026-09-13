@@ -1,5 +1,5 @@
 """
-Tests for the readsb SDR recovery, --sdr-biastee and PyGPSClient setup.
+Tests for the readsb SDR recovery, --sdr-biastee, --wifi-monitor and PyGPSClient setup.
 
 Everything that touches the board (GPIO, sysfs, systemctl, rtl_biast,
 chown) is mocked, so these run anywhere:
@@ -259,6 +259,11 @@ class UnitFileTests(unittest.TestCase):
         self.assertEqual(a.SDR_WATCHDOG_TIMER.rsplit(".", 1)[0],
                          a.SDR_WATCHDOG_SERVICE.rsplit(".", 1)[0])
 
+    def test_wifi_monitor_conf_path(self):
+        # NetworkManager only reads *.conf from conf.d.
+        self.assertTrue(a.WIFI_MONITOR_CONF_PATH.startswith("/etc/NetworkManager/conf.d/"))
+        self.assertTrue(a.WIFI_MONITOR_CONF_PATH.endswith(".conf"))
+
     def test_biastee_dropin(self):
         self.assertIn(f"ExecStartPre=+{a.RTL_BIAST} -d 0 -b 1", a.SDR_BIASTEE_DROPIN)
 
@@ -371,6 +376,88 @@ class SdrBiasteeTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.dropin))
 
 
+class WifiMonitorTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.conf = os.path.join(tmp.name, "conf.d", "99-aiov2-usb-wifi-unmanaged.conf")
+        self.calls = []
+        self.m = types.SimpleNamespace()
+        for name, patcher in {
+            "path": mock.patch.object(a, "WIFI_MONITOR_CONF_PATH", self.conf),
+            "euid": mock.patch.object(a.os, "geteuid", return_value=0),
+            "which": mock.patch.object(a.shutil, "which", return_value="/usr/bin/nmcli"),
+            "call": mock.patch.object(a.subprocess, "call",
+                                      side_effect=lambda cmd, **kw: self.calls.append(cmd) or 0),
+            "print": mock.patch("builtins.print"),
+        }.items():
+            setattr(self.m, name, patcher.start())
+            self.addCleanup(patcher.stop)
+
+    RELOAD = ["nmcli", "general", "reload", "conf"]
+
+    def test_conf_unmanages_the_usb_wifi_by_driver(self):
+        self.assertIn("[keyfile]\nunmanaged-devices=driver:mt7921u\n", a.WIFI_MONITOR_CONF)
+        # Must not match the onboard brcmfmac WiFi carrying the network.
+        self.assertNotIn("brcmfmac", a.WIFI_MONITOR_CONF.split("[keyfile]")[1])
+
+    def test_status(self):
+        with mock.patch("builtins.print") as out:
+            a.wifi_monitor("status")
+            os.makedirs(os.path.dirname(self.conf))
+            open(self.conf, "w").close()
+            a.wifi_monitor("status")
+        self.assertEqual([c.args[0] for c in out.call_args_list], [
+            "USB WiFi reserved for monitor mode: OFF",
+            "USB WiFi reserved for monitor mode: ON",
+        ])
+        self.assertEqual(self.calls, [])
+
+    def test_on_writes_conf_and_reloads_without_restart(self):
+        self.assertEqual(a.wifi_monitor("on"), 0)
+        with open(self.conf) as f:
+            self.assertEqual(f.read(), a.WIFI_MONITOR_CONF)
+        self.assertEqual(os.stat(self.conf).st_mode & 0o777, 0o644)
+        self.assertEqual(self.calls, [self.RELOAD])
+
+    def test_on_is_repeatable(self):
+        a.wifi_monitor("on")
+        a.wifi_monitor("on")
+        self.assertEqual(self.calls, [self.RELOAD, self.RELOAD])
+
+    def test_off_removes_conf_and_reloads(self):
+        a.wifi_monitor("on")
+        self.calls.clear()
+        self.assertEqual(a.wifi_monitor("off"), 0)
+        self.assertFalse(os.path.exists(self.conf))
+        self.assertEqual(self.calls, [self.RELOAD])
+
+    def test_off_when_already_off(self):
+        self.assertEqual(a.wifi_monitor("off"), 0)
+        self.assertEqual(self.calls, [self.RELOAD])
+
+    def test_never_restarts_networkmanager(self):
+        a.wifi_monitor("on")
+        a.wifi_monitor("off")
+        for cmd in self.calls:
+            self.assertNotIn("restart", cmd)
+            self.assertNotIn("kill", " ".join(cmd))
+
+    def test_without_networkmanager_still_writes_conf(self):
+        self.m.which.return_value = None
+        self.assertEqual(a.wifi_monitor("on"), 0)
+        self.assertTrue(os.path.exists(self.conf))
+        self.assertEqual(self.calls, [])
+
+    def test_non_root_reruns_with_sudo(self):
+        self.m.euid.return_value = 1000
+        with mock.patch.object(a, "rerun_with_sudo", side_effect=SystemExit) as rerun:
+            with self.assertRaises(SystemExit):
+                a.wifi_monitor("off")
+        rerun.assert_called_once_with(["--wifi-monitor", "off"])
+        self.assertEqual(self.calls, [])
+
+
 class CliTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run([sys.executable, os.path.join(REPO, "aiov2_ctl.py"), *args],
@@ -388,9 +475,16 @@ class CliTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1)
             self.assertIn("Usage: aiov2_ctl --sdr-biastee on|off|status", res.stdout)
 
-    def test_help_and_completion_list_sdr_biastee(self):
-        self.assertIn("--sdr-biastee", a.HELP_TEXT)
-        self.assertIn("--sdr-biastee", a.BASH_COMPLETION)
+    def test_wifi_monitor_rejects_unknown_state(self):
+        for args in (["--wifi-monitor"], ["--wifi-monitor", "yes"]):
+            res = self.run_cli(*args)
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("Usage: aiov2_ctl --wifi-monitor on|off|status", res.stdout)
+
+    def test_help_and_completion_list_new_commands(self):
+        for opt in ("--sdr-biastee", "--wifi-monitor"):
+            self.assertIn(opt, a.HELP_TEXT)
+            self.assertIn(opt, a.BASH_COMPLETION)
 
 
 class PygpsclientProfileTests(unittest.TestCase):

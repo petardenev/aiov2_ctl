@@ -138,6 +138,28 @@ Powers the SDR antenna input (bias tee) every time readsb starts, for an active 
 
 ---
 
+### USB WiFi monitor mode without losing the internet
+
+```bash
+sudo aiov2_ctl --wifi-monitor on
+sudo aiov2_ctl --wifi-monitor off
+aiov2_ctl --wifi-monitor status
+```
+
+`airmon-ng check kill` stops NetworkManager and wpa_supplicant, which also takes the onboard WiFi (`wlan0`) offline. `--wifi-monitor on` adds `/etc/NetworkManager/conf.d/99-aiov2-usb-wifi-unmanaged.conf`, telling NetworkManager to leave the USB WiFi (MT7961, `mt7921u`) alone, and reloads its configuration without dropping connections. Then skip `check kill`:
+
+```bash
+sudo airmon-ng start wlan1
+sudo airodump-ng wlan1mon
+sudo airmon-ng stop wlan1mon
+```
+
+- `airmon-ng check` still lists NetworkManager; it no longer touches `wlan1`, so ignore it
+- While on, NetworkManager will not connect `wlan1` to networks; `--wifi-monitor off` hands it back
+- The USB rail powers this adapter; keep it on at boot with `sudo aiov2_ctl --boot-rail USB on`
+
+---
+
 ## 4) CLI usage
 
 Show current GPIO state:

@@ -274,6 +274,7 @@ _aiov2_ctl()
         --remove-apps
         --fix-sdr
         --sdr-biastee
+        --wifi-monitor
         --sync-rtc
     "
 
@@ -299,7 +300,7 @@ _aiov2_ctl()
         return 0
     fi
 
-    if [[ "${prev}" == "--mesh-on-boot" || "${prev}" == "--sdr-biastee" ]]; then
+    if [[ "${prev}" == "--mesh-on-boot" || "${prev}" == "--sdr-biastee" || "${prev}" == "--wifi-monitor" ]]; then
         COMPREPLY=( $(compgen -W "on off status" -- "${cur}") )
         return 0
     fi
@@ -449,6 +450,7 @@ USAGE:
   sudo aiov2_ctl --remove-apps
   sudo aiov2_ctl --fix-sdr
   sudo aiov2_ctl --sdr-biastee on|off|status
+  sudo aiov2_ctl --wifi-monitor on|off|status
   sudo aiov2_ctl --sync-rtc
 
 FEATURES:
@@ -472,6 +474,7 @@ COMMANDS:
   --add-apps   Install HackerGadgets AIO apps
   --fix-sdr    Free the RTL-SDR from the kernel DVB driver
   --sdr-biastee  Power the SDR antenna input (bias tee) while readsb runs
+  --wifi-monitor Keep NetworkManager off the USB WiFi for monitor mode
   --sync-rtc   Write current system time to hardware RTC
   --remove-apps   Remove HackerGadgets AIO apps
 
@@ -885,6 +888,19 @@ SDR_BIASTEE_DROPIN = f"""# Installed by aiov2_ctl --sdr-biastee on.
 # start, including after an SDR rail power cycle.
 [Service]
 ExecStartPre=+{RTL_BIAST} -d 0 -b 1
+"""
+
+WIFI_MONITOR_CONF_PATH = "/etc/NetworkManager/conf.d/99-aiov2-usb-wifi-unmanaged.conf"
+
+WIFI_MONITOR_CONF = """# Installed by aiov2_ctl --wifi-monitor on.
+# Leave the AIO v2 USB WiFi (MT7961, mt7921u: wlan1 / wlan1mon) to
+# monitor-mode tools. NetworkManager otherwise re-randomises its MAC for
+# scans and fights monitor mode, which is why airmon-ng suggests
+# "check kill" -- and that stops the NetworkManager and wpa_supplicant
+# keeping the onboard WiFi online. Matching the driver survives both the
+# MAC changes and airmon-ng renaming the interface.
+[keyfile]
+unmanaged-devices=driver:mt7921u
 """
 
 SDR_WATCHDOG_SERVICE_UNIT = """[Unit]
@@ -1411,6 +1427,41 @@ def sdr_biastee(state):
     print(f"SDR bias tee for readsb set to {state.upper()}")
     if state == "on" and not readsb_active:
         print("It switches on the next time readsb starts.")
+    return 0
+
+
+def wifi_monitor(state):
+    """
+    Reserve the USB WiFi for monitor mode, so airmon-ng no longer needs
+    "check kill" and the onboard WiFi stays connected.
+    """
+    enabled = os.path.exists(WIFI_MONITOR_CONF_PATH)
+    if state == "status":
+        print(f"USB WiFi reserved for monitor mode: {'ON' if enabled else 'OFF'}")
+        return 0
+
+    if os.geteuid() != 0:
+        rerun_with_sudo(["--wifi-monitor", state])
+
+    if state == "on":
+        os.makedirs(os.path.dirname(WIFI_MONITOR_CONF_PATH), exist_ok=True)
+        with open(WIFI_MONITOR_CONF_PATH, "w") as f:
+            f.write(WIFI_MONITOR_CONF)
+        os.chmod(WIFI_MONITOR_CONF_PATH, 0o644)
+    elif enabled:
+        os.remove(WIFI_MONITOR_CONF_PATH)
+
+    # A configuration reload applies unmanaged-devices without touching
+    # active connections; a restart would drop the onboard WiFi.
+    if shutil.which("nmcli"):
+        subprocess.call(["nmcli", "general", "reload", "conf"])
+    else:
+        print("NetworkManager not found; the setting applies once it runs.")
+
+    print(f"USB WiFi reserved for monitor mode: {state.upper()}")
+    if state == "on":
+        print("Start monitor mode with: sudo airmon-ng start wlan1")
+        print("Skip 'airmon-ng check kill' — it takes the onboard WiFi down too.")
     return 0
 
 
@@ -2408,6 +2459,13 @@ def main():
             print("Usage: aiov2_ctl --sdr-recovery prestart|poststop|check")
             sys.exit(1)
         sys.exit(sdr_recovery(stage))
+
+    elif arg == "--wifi-monitor":
+        state = sys.argv[2].lower() if len(sys.argv) > 2 else ""
+        if state not in ("on", "off", "status"):
+            print("Usage: aiov2_ctl --wifi-monitor on|off|status")
+            sys.exit(1)
+        sys.exit(wifi_monitor(state))
 
     elif arg == "--sdr-biastee":
         state = sys.argv[2].lower() if len(sys.argv) > 2 else ""
