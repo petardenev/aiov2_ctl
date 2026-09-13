@@ -286,6 +286,18 @@ Behaviour:
 
 ---
 
+## 9) Running the tests
+
+The tests mock all GPIO, sysfs and systemd access, so they run on any machine without touching the board:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+`python3 -m pytest tests` works too if pytest is installed.
+
+---
+
 ## Safety notes
 
 - GPIO writes happen immediately
