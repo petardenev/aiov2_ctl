@@ -411,8 +411,9 @@ Graphical GPS / GNSS diagnostics tool.
 
  • Launch: pygpsclient
  • Initial GPS lock may take time (antenna dependent)
- • On CM5 select the second serial device
+ • Opens on /dev/serial0 (the GPS UART) at 9600 baud
  • Click the USB/UART icon to connect
+ • Keep the GPS powered at boot: sudo aiov2_ctl --boot-rail GPS on
 
 General
 -------
@@ -699,6 +700,15 @@ def target_home(user=None):
         return None
 
 
+PYGPSCLIENT_PATH_LINE = 'export PATH="$HOME/.pygpsclient/bin:$PATH"'
+
+PYGPSCLIENT_CONFIG = """{
+  "userport_s": "/dev/serial0",
+  "bpsrate_n": 9600
+}
+"""
+
+
 def prepare_pygpsclient_profile():
     """
     The pygpsclient package's installer appends a PATH line to the login
@@ -742,6 +752,12 @@ def prepare_pygpsclient_profile():
                     changed = True
                     continue
                 seen_path_line = True
+                # The installer spells the home as /home/"$(logname)", which
+                # comes out empty without a controlling terminal.
+                if stripped != PYGPSCLIENT_PATH_LINE:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    line = indent + PYGPSCLIENT_PATH_LINE
+                    changed = True
                 out.append(line)
                 continue
 
@@ -761,22 +777,46 @@ def prepare_pygpsclient_profile():
 
 
 def finalize_pygpsclient():
-    """Create the launcher the postinst skips when its install script trips."""
-    home = target_home()
+    """
+    Finish what the pygpsclient postinst leaves undone: the launcher it
+    skips when its install script trips, the venv it builds as root inside
+    the user's home, and a first-run config that finds the GPS.
+    """
+    user = target_user()
+    home = target_home(user)
     if not home:
         return
 
-    src = os.path.join(home, ".pygpsclient", "bin", "pygpsclient")
+    venv = os.path.join(home, ".pygpsclient")
+    src = os.path.join(venv, "bin", "pygpsclient")
     link = "/usr/local/bin/pygpsclient"
 
-    if not os.path.isfile(src) or os.path.exists(link):
+    if not os.path.isfile(src):
         return
 
-    print(f"Linking {link} → {src}")
-    try:
-        os.symlink(src, link)
-    except OSError as exc:
-        print(f"Could not create the pygpsclient launcher: {exc}")
+    if not os.path.exists(link):
+        print(f"Linking {link} → {src}")
+        try:
+            os.symlink(src, link)
+        except OSError as exc:
+            print(f"Could not create the pygpsclient launcher: {exc}")
+
+    # A root-owned venv stops PyGPSClient's in-app updater installing into it.
+    owner = pwd.getpwnam(user)
+    if os.stat(venv).st_uid != owner.pw_uid:
+        print(f"Handing {venv} back to {user}…")
+        subprocess.call(["chown", "-R", f"{owner.pw_uid}:{owner.pw_gid}", venv])
+
+    # With no config PyGPSClient preselects the first scanned port,
+    # /dev/ttyACM0 — the uConsole keyboard. /dev/serial0 is the GPS UART and,
+    # being a symlink, is left out of the scan, so as the user-defined port
+    # it is listed first and selected.
+    config = os.path.join(home, "pygpsclient.json")
+    if not os.path.exists(config):
+        print(f"Pointing PyGPSClient at the GPS UART → {config}")
+        with open(config, "w") as f:
+            f.write(PYGPSCLIENT_CONFIG)
+        os.chown(config, owner.pw_uid, owner.pw_gid)
 
 
 def readsb_json_present():

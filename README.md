@@ -95,7 +95,7 @@ Installs and configures:
 - **`meshtastic-mui`** — Meshtastic graphical UI for LoRa / Meshtastic devices (depends on the AIO package)
 - **`sdrpp-brown`** — Preconfigured SDR++ build for the uConsole (RF scanning/listening via SDR)
 - **`tar1090`** — ADS-B aircraft tracking web UI (visualises planes from your SDR feed)
-- **`pygpsclient`** — GPS monitoring and diagnostics GUI (position, satellites, NMEA data)
+- **`pygpsclient`** — GPS monitoring and diagnostics GUI (position, satellites, NMEA data), preset to the GPS UART (`/dev/serial0`, 9600 baud)
 
 This pulls in supporting services (RTC, GPIO helpers, and desktop menu entries) used by the HackerGadgets AIO ecosystem.
 
